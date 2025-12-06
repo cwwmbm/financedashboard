@@ -41,10 +41,16 @@ export function SubscriptionsPanel({ transactions, onToggleSubscription, onUpdat
     return Array.from(grouped.entries())
       .map(([name, data]) => {
         const avgAmount = data.amounts.reduce((a, b) => a + b, 0) / data.amounts.length
+        // Get frequency from the first transaction (all transactions from same vendor should have same frequency)
+        const firstTransaction = transactions.find((t) => data.transactionIds.includes(t.id))
+        const frequency = firstTransaction?.subscriptionFrequency 
+          ? firstTransaction.subscriptionFrequency === "monthly" ? "Monthly" : "Annual"
+          : data.amounts.length > 1 ? "Monthly" : "One-time"
+        
         return {
           name,
           amount: Math.round(avgAmount * 100) / 100,
-          frequency: data.amounts.length > 1 ? "Monthly" : "One-time",
+          frequency,
           lastCharge: data.lastCharge,
           chargeCount: data.amounts.length,
           transactionIds: data.transactionIds,

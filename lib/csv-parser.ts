@@ -31,7 +31,16 @@ const CATEGORY_KEYWORDS: Record<string, string[]> = {
   Travel: ["hotel", "airline", "flight", "airbnb", "booking", "expedia"],
 }
 
-function detectCategory(description: string): string {
+function detectCategory(description: string, vendorCategoryMappings?: Record<string, string>): string {
+  // First, check if we have a vendor-category mapping
+  if (vendorCategoryMappings) {
+    const vendor = extractVendor(description)
+    if (vendorCategoryMappings[vendor]) {
+      return vendorCategoryMappings[vendor]
+    }
+  }
+
+  // Fall back to keyword-based detection
   const lower = description.toLowerCase()
   for (const [category, keywords] of Object.entries(CATEGORY_KEYWORDS)) {
     if (keywords.some((keyword) => lower.includes(keyword))) {
@@ -48,6 +57,11 @@ function extractVendor(description: string): string {
     .replace(/\d{4,}/g, "")
     .replace(/[#*]/g, "")
     .trim()
+
+  // Remove alphanumeric codes that appear after vendor names (like WordPress K94zgm, 6eavyqwv9r, etc.)
+  // These are typically 6-12 characters, alphanumeric, and appear after the vendor name
+  vendor = vendor.replace(/\s+[a-z0-9]{6,12}\b/gi, "") // Remove codes like "K94zgm", "6eavyqwv9r", "A75g1y3h1d"
+  vendor = vendor.replace(/\s+[a-z0-9]{8,}\b/gi, "") // Remove longer codes
 
   // Take first meaningful part
   const parts = vendor.split(/\s{2,}|\/|\\|-/)
@@ -466,10 +480,42 @@ class RecurringDetector {
 
     // Find groups with multiple occurrences (likely recurring)
     for (const [key, groupTransactions] of groups.entries()) {
-      if (groupTransactions.length < 2) continue // Need at least 2 occurrences
+      // Require at least 2 transactions
+      if (groupTransactions.length < 2) continue
 
       // Sort by date
       groupTransactions.sort((a, b) => a.date.getTime() - b.date.getTime())
+
+      // Check if all transactions are on the same day - if so, skip (not a subscription)
+      const firstDate = groupTransactions[0].date
+      const allSameDay = groupTransactions.every((t) => {
+        return t.date.getFullYear() === firstDate.getFullYear() &&
+               t.date.getMonth() === firstDate.getMonth() &&
+               t.date.getDate() === firstDate.getDate()
+      })
+      if (allSameDay) {
+        continue // All transactions on same day = not a subscription
+      }
+
+      // Require at least 2 transactions across different dates
+      // For 2 transactions, they must be at least 20 days apart (to avoid same-day duplicates)
+      if (groupTransactions.length === 2) {
+        const daysDiff = Math.abs(
+          (groupTransactions[1].date.getTime() - groupTransactions[0].date.getTime()) / (1000 * 60 * 60 * 24)
+        )
+        if (daysDiff < 20) {
+          continue // Too close together, likely not a subscription
+        }
+        
+        // CRITICAL: For 2 transactions, they must be clearly monthly (20-40 days) or annual (350-380 days)
+        // Not just any random interval where they happen to be on the same day of month
+        const isMonthly = daysDiff >= 20 && daysDiff <= 40
+        const isAnnual = daysDiff >= 350 && daysDiff <= 380
+        
+        if (!isMonthly && !isAnnual) {
+          continue // Not a clear monthly or annual pattern - likely coincidental
+        }
+      }
 
       // Check if amounts are similar (within 10% variance for subscriptions)
       // Some subscriptions may have slight price changes
@@ -505,11 +551,31 @@ class RecurringDetector {
   }
 
   /**
-   * Normalize transaction key for grouping (restored from original working version)
+   * Normalize transaction key for grouping
+   * Group by description only (not amount) to handle currency conversion variations
+   * Amount similarity will be checked later in the detection logic
    */
   private normalizeKey(transaction: ParsedTransaction): string {
-    // Normalize description: lowercase, remove extra spaces, remove common prefixes
+    // Remove location suffixes BEFORE lowercasing (they're often all-caps)
     let desc = transaction.description
+    // Remove trailing all-caps words separated by multiple spaces (likely locations)
+    // Pattern: 2+ spaces + all caps word(s) (4+ chars) at end
+    // This catches "SUPABASE                SINGAPORE" -> "SUPABASE"
+    desc = desc.replace(/\s{2,}([A-Z]{4,}(\s+[A-Z]{4,})*)\s*$/g, "").trim()
+    // Also handle single space before location (e.g., "SAN FRANCISCO" after "SUBSCR")
+    // Common location patterns at end: single all-caps word or two all-caps words
+    desc = desc.replace(/\s+(SAN FRANCISCO|COVINA|SINGAPORE|VANCOUVER|MONTREAL|TORONTO|NEW YORK|LOS ANGELES)\s*$/i, "").trim()
+    // Generic: any trailing all-caps word(s) that look like locations
+    desc = desc.replace(/\s+([A-Z]{4,}(\s+[A-Z]{4,})*)\s*$/g, (match, location) => {
+      // Only remove if it's all caps and looks like a location (not part of vendor name)
+      if (location === location.toUpperCase() && location.length >= 4) {
+        return ""
+      }
+      return match
+    }).trim()
+    
+    // Now normalize: lowercase, remove extra spaces, remove common prefixes
+    desc = desc
       .toLowerCase()
       .replace(/\s+/g, " ")
       .trim()
@@ -520,11 +586,24 @@ class RecurringDetector {
 
     // Remove transaction IDs, reference numbers, confirmation codes, etc.
     desc = desc.replace(/\b\d{10,}\b/g, "") // Remove long numbers (likely IDs)
-    desc = desc.replace(/\b[a-z0-9]{8,}\b/gi, "") // Remove long alphanumeric codes (like P3A5017B5F)
+    
+    // Remove alphanumeric codes, but be more careful - don't remove vendor names
+    // Codes are typically: mixed case with numbers, or all lowercase/uppercase with numbers
+    // Vendor names are typically: proper nouns (mixed case) or common words
+    // Remove codes that look like transaction IDs (e.g., "P3A5017B5F", "K94zgm", "6eavyqwv9r")
+    // But keep words that are likely vendor names (e.g., "vercel", "openai", "chatgpt")
+    desc = desc.replace(/\b[a-z]*[0-9]+[a-z0-9]*\b/gi, "") // Remove alphanumeric codes with numbers
+    desc = desc.replace(/\b[a-z]{1,2}[0-9]{4,}[a-z0-9]*\b/gi, "") // Remove codes like "K94zgm"
+    desc = desc.replace(/\b[0-9]+[a-z]{4,}\b/gi, "") // Remove codes starting with numbers
+    
     desc = desc.replace(/\*\d{4}/g, "") // Remove card last 4 digits like *1234
+    desc = desc.replace(/\*[a-z]+/gi, "") // Remove things like *CHATGPT, *GSUITE (but keep vendor name)
 
     // Remove common suffixes like "ONLINE", "AUTHORIZED", etc.
     desc = desc.replace(/\s+(online|authorized|pending|completed|processed)$/i, "")
+    desc = desc.replace(/\s+(subscr|subscription)$/i, "") // Remove "subscr" suffix
+    // Remove underscores and replace with spaces
+    desc = desc.replace(/_/g, " ")
 
     // Remove extra whitespace
     desc = desc.replace(/\s+/g, " ").trim()
@@ -533,8 +612,9 @@ class RecurringDetector {
     const words = desc.split(/\s+/).filter((w) => w.length > 2)
     const keyWords = words.slice(0, 4).join(" ") // Use first 4 meaningful words
 
-    // Round amount to nearest dollar for grouping (subscriptions are usually same amount)
-    const roundedAmount = Math.round(transaction.amount)
+    // Round amount to nearest $2 for grouping (handles small currency conversion variations)
+    // This groups Supabase ($35-37) and Vercel ($28-30) together without being too aggressive
+    const roundedAmount = Math.round(transaction.amount / 2) * 2
 
     return `${keyWords}|${roundedAmount}`
   }
@@ -586,8 +666,10 @@ class RecurringDetector {
 
 /**
  * Main CSV parser function - detects format and parses accordingly
+ * @param content - CSV file content
+ * @param vendorCategoryMappings - Optional mapping of vendor names to categories
  */
-export function parseCSV(content: string): Transaction[] {
+export function parseCSV(content: string, vendorCategoryMappings?: Record<string, string>): Transaction[] {
   const lines = content
     .split("\n")
     .map((line) => line.trim())
@@ -697,7 +779,7 @@ export function parseCSV(content: string): Transaction[] {
       description: t.description,
       amount: t.amount,
       vendor: extractVendor(t.description),
-      category: detectCategory(t.description),
+      category: detectCategory(t.description, vendorCategoryMappings),
       isSubscription: false, // Will be set after all transactions are combined
       type: t.type, // Preserve debit/credit type
     }

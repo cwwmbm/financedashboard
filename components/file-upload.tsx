@@ -2,13 +2,28 @@
 
 import type React from "react"
 
-import { useCallback } from "react"
+import { useCallback, useEffect, useState } from "react"
 import { Upload, FileSpreadsheet, ArrowRight } from "lucide-react"
 import { Card, CardContent } from "@/components/ui/card"
 import { Button } from "@/components/ui/button"
 import { parseCSV, detectSubscriptions } from "@/lib/csv-parser"
 import { generateSampleData } from "@/lib/sample-data"
 import type { ParsedData } from "@/lib/types"
+
+// Load vendor-category mappings from API
+async function loadVendorCategoryMappings(): Promise<Record<string, string>> {
+  try {
+    const response = await fetch("/api/vendor-categories")
+    if (!response.ok) {
+      return {}
+    }
+    const data = await response.json()
+    return data.mappings || {}
+  } catch (error) {
+    console.error("Failed to load vendor-category mappings:", error)
+    return {}
+  }
+}
 
 interface FileUploadProps {
   onDataParsed: (data: ParsedData) => void
@@ -17,17 +32,29 @@ interface FileUploadProps {
 }
 
 export function FileUpload({ onDataParsed, isLoading, setIsLoading }: FileUploadProps) {
+  const [vendorMappings, setVendorMappings] = useState<Record<string, string>>({})
+
+  // Load vendor-category mappings on mount
+  useEffect(() => {
+    loadVendorCategoryMappings().then(setVendorMappings)
+  }, [])
+
   const handleFiles = useCallback(
     async (files: FileList | null) => {
       if (!files || files.length === 0) return
 
       setIsLoading(true)
+      
+      // Reload mappings in case they were updated
+      const mappings = await loadVendorCategoryMappings()
+      setVendorMappings(mappings)
+      
       const allTransactions: ParsedData["transactions"] = []
 
       for (const file of Array.from(files)) {
         if (file.type === "text/csv" || file.name.endsWith(".csv")) {
           const content = await file.text()
-          const transactions = parseCSV(content)
+          const transactions = parseCSV(content, mappings)
           allTransactions.push(...transactions)
         }
       }

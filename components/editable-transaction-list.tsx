@@ -1,124 +1,123 @@
 "use client"
 
 import { useState, useEffect } from "react"
-import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
+import { Trash2, Plus, X } from "lucide-react"
+import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
-import { Trash2 } from "lucide-react"
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
 import type { Transaction } from "@/lib/types"
 
 interface EditableTransactionListProps {
   transactions: Transaction[]
-  allTransactions: Transaction[] // Full transaction list to update all vendor transactions
+  allTransactions: Transaction[]
   onUpdateTransactions: (updatedTransactions: Transaction[]) => void
 }
 
-const DEFAULT_CATEGORIES = [
-  "Food & Dining",
-  "Shopping",
-  "Transportation",
-  "Entertainment",
-  "Utilities",
-  "Health",
-  "Travel",
-  "Other",
-]
+export function EditableTransactionList({
+  transactions,
+  allTransactions,
+  onUpdateTransactions,
+}: EditableTransactionListProps) {
+  const [allCategories, setAllCategories] = useState<string[]>([])
+  const [hoveredId, setHoveredId] = useState<string | null>(null)
 
-// Load categories from API
-async function loadCategories(): Promise<string[]> {
-  try {
-    const response = await fetch("/api/categories")
-    if (!response.ok) {
-      return DEFAULT_CATEGORIES
-    }
-    const data = await response.json()
-    return data.categories || DEFAULT_CATEGORIES
-  } catch (error) {
-    console.error("Failed to load categories:", error)
-    return DEFAULT_CATEGORIES
-  }
-}
-
-export function EditableTransactionList({ transactions, allTransactions, onUpdateTransactions }: EditableTransactionListProps) {
-  const [editingId, setEditingId] = useState<string | null>(null)
-  const [categories, setCategories] = useState<string[]>(DEFAULT_CATEGORIES)
-
-  // Load categories on mount and when transactions change (in case categories were updated)
+  // Load categories
   useEffect(() => {
-    loadCategories().then(setCategories)
-  }, [allTransactions.length]) // Reload when transaction count changes (indicates updates)
+    async function loadCategories() {
+      try {
+        const response = await fetch("/api/categories")
+        const data = await response.json()
+        setAllCategories(data.categories || [])
+      } catch (error) {
+        console.error("Error loading categories:", error)
+      }
+    }
+    loadCategories()
+  }, [])
 
-  // Get all unique categories from saved categories and existing transactions
-  const allCategories = Array.from(
-    new Set([
-      ...categories,
-      ...allTransactions.map((t) => t.category).filter(Boolean),
-    ])
-  ).sort()
-
-  const handleCategoryChange = (transactionId: string, newCategory: string) => {
-    // Find the transaction being edited
-    const editedTransaction = transactions.find((t) => t.id === transactionId)
-    if (!editedTransaction) return
-
-    // Get the vendor from the edited transaction
-    const vendor = editedTransaction.vendor
-
-    // Update ALL transactions from the same vendor in the full transaction list
+  // Handle category change
+  async function handleCategoryChange(transaction: Transaction, newCategory: string) {
+    // Update all transactions from the same vendor
     const updated = allTransactions.map((t) => {
-      if (t.vendor === vendor) {
+      if (t.vendor === transaction.vendor) {
         return { ...t, category: newCategory }
       }
       return t
     })
 
+    // Save vendor-category mapping
+    try {
+      await fetch("/api/vendor-categories", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          vendor: transaction.vendor,
+          category: newCategory,
+        }),
+      })
+    } catch (error) {
+      console.error("Error saving vendor-category mapping:", error)
+    }
+
     onUpdateTransactions(updated)
-    setEditingId(null)
   }
 
-  const handleDeleteTransaction = (transactionId: string) => {
-    // Remove the transaction from the full transaction list
+  // Handle subscription toggle
+  async function handleSubscriptionChange(
+    transaction: Transaction,
+    isSubscription: boolean,
+    frequency?: "monthly" | "annual",
+  ) {
+    const updated = allTransactions.map((t) => {
+      if (t.id === transaction.id) {
+        return {
+          ...t,
+          isSubscription,
+          subscriptionFrequency: isSubscription ? frequency : undefined,
+        }
+      }
+      return t
+    })
+
+    onUpdateTransactions(updated)
+  }
+
+  // Handle transaction deletion
+  function handleDelete(transactionId: string) {
     const updated = allTransactions.filter((t) => t.id !== transactionId)
     onUpdateTransactions(updated)
   }
 
   if (transactions.length === 0) {
-    return <p className="text-sm text-muted-foreground">No transactions found</p>
+    return (
+      <div className="text-center py-8 text-muted-foreground">
+        <p>No transactions found</p>
+      </div>
+    )
   }
 
-  const total = transactions.reduce((sum, t) => sum + t.amount, 0)
-
   return (
-    <div className="space-y-2">
-      <div className="flex items-center justify-between mb-4 pb-2 border-b border-border">
-        <span className="text-sm text-muted-foreground">
-          {transactions.length} transaction{transactions.length !== 1 ? "s" : ""}
-        </span>
-        <span className="text-sm font-medium">Total: ${total.toFixed(2)}</span>
-      </div>
-      {transactions.map((t) => (
-        <div
-          key={t.id}
-          className="flex items-center justify-between p-3 rounded-lg bg-secondary/50 hover:bg-secondary transition-colors group"
-        >
-          <div className="flex-1 min-w-0">
-            <p className="font-medium truncate">{t.vendor}</p>
-            <div className="flex items-center gap-2 mt-1">
-              <span className="text-xs text-muted-foreground">
-                {t.date instanceof Date
-                  ? t.date.toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" })
-                  : new Date(t.date).toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" })}
-              </span>
-              {editingId === t.id ? (
+    <div className="space-y-2 max-h-[600px] overflow-y-auto">
+      {transactions.map((transaction) => {
+        const date = transaction.date instanceof Date ? transaction.date : new Date(transaction.date)
+        const isDebit = transaction.type === "debit"
+        const amountDisplay = isDebit ? `-$${transaction.amount.toFixed(2)}` : `+$${transaction.amount.toFixed(2)}`
+
+        return (
+          <div
+            key={transaction.id}
+            className="flex items-center justify-between p-3 rounded-lg bg-secondary/50 hover:bg-secondary transition-colors group"
+            onMouseEnter={() => setHoveredId(transaction.id)}
+            onMouseLeave={() => setHoveredId(null)}
+          >
+            <div className="flex-1 min-w-0">
+              <div className="flex items-center gap-2 mb-1">
+                <p className="font-medium text-sm truncate">{transaction.vendor}</p>
                 <Select
-                  value={t.category}
-                  onValueChange={(value) => handleCategoryChange(t.id, value)}
-                  onOpenChange={(open) => {
-                    if (!open) {
-                      setEditingId(null)
-                    }
-                  }}
+                  value={transaction.category}
+                  onValueChange={(value) => handleCategoryChange(transaction, value)}
                 >
-                  <SelectTrigger className="h-6 w-[140px] text-xs">
+                  <SelectTrigger className="h-6 px-2 text-xs">
                     <SelectValue />
                   </SelectTrigger>
                   <SelectContent>
@@ -129,38 +128,83 @@ export function EditableTransactionList({ transactions, allTransactions, onUpdat
                     ))}
                   </SelectContent>
                 </Select>
-              ) : (
-                <span
-                  className="text-xs px-1.5 py-0.5 rounded bg-secondary text-secondary-foreground cursor-pointer hover:bg-secondary/80 transition-colors"
-                  onClick={() => setEditingId(t.id)}
-                  title="Click to edit category"
-                >
-                  {t.category}
-                </span>
-              )}
-              {t.isSubscription && (
-                <span className="text-xs px-1.5 py-0.5 rounded bg-primary/20 text-primary">
-                  Sub
-                </span>
-              )}
+              </div>
+              <div className="flex items-center gap-2 flex-wrap">
+                <p className="text-xs text-muted-foreground">
+                  {date.toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" })}
+                </p>
+                <p className={`text-xs font-mono ${isDebit ? "text-red-400" : "text-green-400"}`}>
+                  {amountDisplay}
+                </p>
+                {transaction.isSubscription ? (
+                  <Select
+                    value={transaction.subscriptionFrequency || "monthly"}
+                    onValueChange={(value) => {
+                      if (value === "remove") {
+                        handleSubscriptionChange(transaction, false)
+                      } else {
+                        handleSubscriptionChange(transaction, true, value as "monthly" | "annual")
+                      }
+                    }}
+                  >
+                    <SelectTrigger className="h-6 px-2 text-xs">
+                      <SelectValue>
+                        {transaction.subscriptionFrequency === "annual" ? "Annual Sub" : "Monthly Sub"}
+                      </SelectValue>
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="monthly">Monthly Sub</SelectItem>
+                      <SelectItem value="annual">Annual Sub</SelectItem>
+                      <SelectItem value="remove">Remove Subscription</SelectItem>
+                    </SelectContent>
+                  </Select>
+                ) : (
+                  <Select
+                    onValueChange={(value) =>
+                      handleSubscriptionChange(transaction, true, value as "monthly" | "annual")
+                    }
+                  >
+                    <SelectTrigger className="h-6 px-2 text-xs">
+                      <Plus className="w-3 h-3 mr-1" />
+                      <span>Sub</span>
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="monthly">Monthly</SelectItem>
+                      <SelectItem value="annual">Annual</SelectItem>
+                    </SelectContent>
+                  </Select>
+                )}
+                {transaction.isSubscription && (
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    className="h-5 w-5 p-0 text-xs"
+                    onClick={(e) => {
+                      e.stopPropagation()
+                      handleSubscriptionChange(transaction, false)
+                    }}
+                  >
+                    <X className="w-3 h-3" />
+                  </Button>
+                )}
+              </div>
             </div>
+            {hoveredId === transaction.id && (
+              <Button
+                variant="ghost"
+                size="sm"
+                className="h-8 w-8 p-0 text-destructive hover:text-destructive hover:bg-destructive/10"
+                onClick={(e) => {
+                  e.stopPropagation()
+                  handleDelete(transaction.id)
+                }}
+              >
+                <Trash2 className="w-4 h-4" />
+              </Button>
+            )}
           </div>
-          <div className="flex items-center gap-3 ml-4">
-            <span className="font-mono font-medium text-destructive">
-              ${t.amount.toFixed(2)}
-            </span>
-            <Button
-              variant="ghost"
-              size="icon-sm"
-              onClick={() => handleDeleteTransaction(t.id)}
-              className="h-7 w-7 text-muted-foreground hover:text-destructive opacity-0 group-hover:opacity-100 transition-opacity"
-              title="Delete transaction"
-            >
-              <Trash2 className="h-4 w-4" />
-            </Button>
-          </div>
-        </div>
-      ))}
+        )
+      })}
     </div>
   )
 }

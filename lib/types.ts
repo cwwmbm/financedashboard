@@ -6,6 +6,7 @@ export interface Transaction {
   vendor: string
   category: string
   isSubscription: boolean
+  subscriptionFrequency?: "monthly" | "annual" // Only set if isSubscription is true
   type: "debit" | "credit" // debit = spending, credit = payment received
 }
 
