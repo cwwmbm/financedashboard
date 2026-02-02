@@ -88,8 +88,10 @@ export function SubscriptionsPanel({ transactions, onToggleSubscription, onUpdat
   const monthlyTotal = subscriptions.filter((s) => s.frequency === "Monthly").reduce((sum, s) => sum + s.amount, 0)
 
   const handleRemoveSubscription = (transactionIds: string[]) => {
-    if (onToggleSubscription) {
-      transactionIds.forEach((id) => onToggleSubscription(id, false))
+    if (onUpdateTransactions) {
+      // Remove all transactions with these IDs from the dataset
+      const updated = transactions.filter((t) => !transactionIds.includes(t.id))
+      onUpdateTransactions(updated)
     }
   }
 
@@ -162,7 +164,7 @@ export function SubscriptionsPanel({ transactions, onToggleSubscription, onUpdat
         {subscriptions.length === 0 ? (
           <p className="text-sm text-muted-foreground text-center py-8">No subscriptions detected</p>
         ) : (
-          <div className="space-y-3 max-h-[300px] overflow-y-auto pr-2">
+          <div className="space-y-3 max-h-[500px] overflow-y-auto pr-2">
             {subscriptions.map((sub) => (
               <div 
                 key={sub.name} 
@@ -194,7 +196,7 @@ export function SubscriptionsPanel({ transactions, onToggleSubscription, onUpdat
                       handleRemoveSubscription(sub.transactionIds)
                     }}
                     className="opacity-0 group-hover:opacity-100 transition-opacity p-1 hover:bg-destructive/20 rounded"
-                    title="Remove from subscriptions"
+                    title="Delete all transactions for this vendor"
                   >
                     <X className="w-4 h-4 text-destructive" />
                   </button>

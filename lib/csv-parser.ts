@@ -1,5 +1,166 @@
 import type { Transaction } from "./types"
 
+/**
+ * Normalize vendor name for comparison - removes store numbers, location codes, etc.
+ * This helps identify when "Tom Sushi #50929 BC" and "Tom Sushi #50788 BC" are the same vendor
+ */
+export function normalizeVendorForGrouping(vendor: string): string {
+  let normalized = vendor.trim()
+  
+  // Remove store numbers: #123, #1234, #12345, etc.
+  // Pattern: # followed by 1-6 digits, optionally with spaces before/after
+  normalized = normalized.replace(/\s*#\s*\d{1,6}\s*/g, " ")
+  
+  // Remove location codes: BC, CA, ON, QC, AB, etc. (Canadian provinces and US states)
+  // Also remove common abbreviations that appear at the end
+  const locationCodes = /\s+(BC|CA|ON|QC|AB|SK|MB|NB|NS|PE|NL|YT|NT|NU|AK|AL|AR|AZ|CO|CT|DE|FL|GA|HI|IA|ID|IL|IN|KS|KY|LA|MA|MD|ME|MI|MN|MO|MS|MT|NC|ND|NE|NH|NJ|NM|NV|NY|OH|OK|OR|PA|RI|SC|SD|TN|TX|UT|VA|VT|WA|WI|WV|WY)\s*$/i
+  normalized = normalized.replace(locationCodes, "")
+  
+  // Remove single-letter location indicators at the end (like "N" for North, "S" for South)
+  normalized = normalized.replace(/\s+[NSWE]\s*$/i, "")
+  
+  // Remove trailing location names that might have been partially captured
+  // Common patterns: "Grand Forks", "New Denver", etc. - but be careful not to remove vendor names
+  // Only remove if it's clearly a location pattern (2+ words, proper case, at the end)
+  normalized = normalized.replace(/\s+([A-Z][a-z]+\s+[A-Z][a-z]+)\s*$/, "")
+  
+  // Clean up multiple spaces
+  normalized = normalized.replace(/\s+/g, " ").trim()
+  
+  // Convert to lowercase for comparison
+  return normalized.toLowerCase()
+}
+
+/**
+ * Group transactions by normalized vendor name
+ * Returns a map of normalized vendor name -> array of unique vendor names
+ */
+export function groupSimilarVendors(transactions: Transaction[]): Map<string, Set<string>> {
+  const groups = new Map<string, Set<string>>()
+  
+  for (const transaction of transactions) {
+    const normalized = normalizeVendorForGrouping(transaction.vendor)
+    if (!groups.has(normalized)) {
+      groups.set(normalized, new Set())
+    }
+    groups.get(normalized)!.add(transaction.vendor)
+  }
+  
+  return groups
+}
+
+/**
+ * Find vendor groups that have multiple variants (indicating they might be the same vendor)
+ * Returns an array of groups with their variants
+ */
+export function findVendorVariants(transactions: Transaction[]): Array<{
+  normalizedName: string
+  variants: string[]
+  transactionCount: number
+}> {
+  const groups = groupSimilarVendors(transactions)
+  const variants: Array<{
+    normalizedName: string
+    variants: string[]
+    transactionCount: number
+  }> = []
+  
+  for (const [normalized, vendorSet] of groups.entries()) {
+    if (vendorSet.size > 1) {
+      // Count transactions for this normalized vendor
+      const count = transactions.filter(t => 
+        normalizeVendorForGrouping(t.vendor) === normalized
+      ).length
+      
+      variants.push({
+        normalizedName: normalized,
+        variants: Array.from(vendorSet).sort(),
+        transactionCount: count
+      })
+    }
+  }
+  
+  // Sort by transaction count (most common first)
+  return variants.sort((a, b) => b.transactionCount - a.transactionCount)
+}
+
+/**
+ * Merge vendor names in transactions - replaces all variant vendor names with a canonical name
+ * @param transactions - Array of transactions to update
+ * @param vendorMapping - Map of variant vendor name -> canonical vendor name
+ * @returns Updated transactions array
+ */
+export function mergeVendorNames(
+  transactions: Transaction[],
+  vendorMapping: Map<string, string>
+): Transaction[] {
+  return transactions.map(transaction => {
+    const canonicalName = vendorMapping.get(transaction.vendor)
+    if (canonicalName) {
+      return {
+        ...transaction,
+        vendor: canonicalName
+      }
+    }
+    return transaction
+  })
+}
+
+/**
+ * Auto-detect and merge similar vendors in transactions
+ * This function cycles through transactions and groups vendors that are likely the same
+ * @param transactions - Array of transactions
+ * @param minVariants - Minimum number of variants required to merge (default: 2)
+ * @returns Updated transactions with merged vendor names
+ */
+export function autoMergeVendors(
+  transactions: Transaction[],
+  minVariants: number = 2
+): { transactions: Transaction[], mergedGroups: Array<{ canonical: string, variants: string[] }> } {
+  const variants = findVendorVariants(transactions)
+  const vendorMapping = new Map<string, string>()
+  const mergedGroups: Array<{ canonical: string, variants: string[] }> = []
+  
+  for (const group of variants) {
+    if (group.variants.length >= minVariants) {
+      // Choose the most common variant as canonical, or the shortest one if tied
+      const variantCounts = new Map<string, number>()
+      for (const variant of group.variants) {
+        const count = transactions.filter(t => t.vendor === variant).length
+        variantCounts.set(variant, count)
+      }
+      
+      // Sort by count (descending), then by length (ascending)
+      const sortedVariants = Array.from(variantCounts.entries())
+        .sort((a, b) => {
+          if (b[1] !== a[1]) return b[1] - a[1] // Higher count first
+          return a[0].length - b[0].length // Shorter name first
+        })
+      
+      const canonical = sortedVariants[0][0]
+      
+      // Map all variants to canonical name
+      for (const variant of group.variants) {
+        if (variant !== canonical) {
+          vendorMapping.set(variant, canonical)
+        }
+      }
+      
+      mergedGroups.push({
+        canonical,
+        variants: group.variants
+      })
+    }
+  }
+  
+  const updatedTransactions = mergeVendorNames(transactions, vendorMapping)
+  
+  return {
+    transactions: updatedTransactions,
+    mergedGroups
+  }
+}
+
 // Internal transaction type for parsing (before conversion to Transaction)
 interface ParsedTransaction {
   date: Date
@@ -53,26 +214,85 @@ function detectCategory(description: string, vendorCategoryMappings?: Record<str
 function extractVendor(description: string): string {
   // Clean up common prefixes and extract vendor name
   let vendor = description
-    .replace(/^(pos |debit |credit |ach |check |wire |transfer )/i, "")
-    .replace(/\d{4,}/g, "")
-    .replace(/[#*]/g, "")
+    .replace(/^(pos |debit |credit |ach |check |wire |transfer |purchase |payment )/i, "")
     .trim()
 
-  // Remove alphanumeric codes that appear after vendor names (like WordPress K94zgm, 6eavyqwv9r, etc.)
-  // These are typically 6-12 characters, alphanumeric, and appear after the vendor name
-  vendor = vendor.replace(/\s+[a-z0-9]{6,12}\b/gi, "") // Remove codes like "K94zgm", "6eavyqwv9r", "A75g1y3h1d"
-  vendor = vendor.replace(/\s+[a-z0-9]{8,}\b/gi, "") // Remove longer codes
-
-  // Take first meaningful part
-  const parts = vendor.split(/\s{2,}|\/|\\|-/)
-  vendor = parts[0]?.trim() || description
-
-  // Capitalize properly
-  return vendor
-    .split(" ")
-    .map((word) => word.charAt(0).toUpperCase() + word.slice(1).toLowerCase())
-    .join(" ")
-    .substring(0, 30)
+  // Remove location suffixes (cities, states, countries) that appear at the end
+  // Common patterns: "Vancouver", "SAN FRANCISCO", "COVINA", etc.
+  // These are typically all-caps or proper case, and appear after multiple spaces or at the end
+  vendor = vendor.replace(/\s{2,}([A-Z]{4,}(\s+[A-Z]{4,})*)\s*$/g, "") // Remove trailing all-caps locations after 2+ spaces
+  vendor = vendor.replace(/\s+(VANCOUVER|COVINA|SINGAPORE|SAN FRANCISCO|MONTREAL|TORONTO|NEW YORK|LOS ANGELES|ABBOTSFORD|BURNABY|RICHMOND|SURREY|CALGARY|EDMONTON|OTTAWA|QUEBEC|WINNIPEG|HAMILTON|KITCHENER|LONDON|HALIFAX|VICTORIA|WINDSOR|SASKATOON|REGINA|ST\.?\s*JOHN|ST\.?\s*JOHN'S|CHARLOTTETOWN|FREDERICTON|YELLOWKNIFE|WHITEHORSE|IQALUIT)\s*$/i, "")
+  
+  // Remove phone numbers (e.g., "866-216-1072")
+  vendor = vendor.replace(/\s+\d{3}[-.\s]?\d{3}[-.\s]?\d{4}\s*$/g, "")
+  
+  // Remove store numbers: #123, #1234, #12345, etc. (before removing other codes)
+  // Pattern: # followed by 1-6 digits, optionally with spaces before/after
+  vendor = vendor.replace(/\s*#\s*\d{1,6}\s*/g, " ")
+  
+  // Remove transaction IDs and reference numbers (long numbers, alphanumeric codes)
+  vendor = vendor.replace(/\s+\d{10,}\s*$/g, "") // Remove trailing long numbers
+  vendor = vendor.replace(/\s+[A-Z0-9]{8,}\s*$/g, "") // Remove trailing long alphanumeric codes (like "BB82053A1")
+  vendor = vendor.replace(/\s+[a-z0-9]{6,12}\b/gi, "") // Remove codes like "K94zgm", "6eavyqwv9r"
+  
+  // Remove card number suffixes (like "*1234" or "*CHATGPT")
+  vendor = vendor.replace(/\*\d{4,}\s*$/g, "")
+  vendor = vendor.replace(/\*[A-Z]+\s*$/g, "")
+  
+  // Remove common suffixes
+  vendor = vendor.replace(/\s+(ONLINE|AUTHORIZED|PENDING|COMPLETED|PROCESSED|SUBSCR|SUBSCRIPTION)\s*$/i, "")
+  
+  // Remove location codes: BC, CA, ON, QC, etc. (Canadian provinces and US states)
+  // These often appear at the end after store numbers
+  const locationCodes = /\s+(BC|CA|ON|QC|AB|SK|MB|NB|NS|PE|NL|YT|NT|NU|AK|AL|AR|AZ|CO|CT|DE|FL|GA|HI|IA|ID|IL|IN|KS|KY|LA|MA|MD|ME|MI|MN|MO|MS|MT|NC|ND|NE|NH|NJ|NM|NV|NY|OH|OK|OR|PA|RI|SC|SD|TN|TX|UT|VA|VT|WA|WI|WV|WY)\s*$/i
+  vendor = vendor.replace(locationCodes, "")
+  
+  // Remove single-letter location indicators at the end (like "N" for North, "S" for South)
+  vendor = vendor.replace(/\s+[NSWE]\s*$/i, "")
+  
+  // Clean up multiple spaces and normalize whitespace
+  vendor = vendor.replace(/\s{2,}/g, " ").trim()
+  
+  // Split by common separators but preserve vendor name parts
+  // Instead of taking only first part, try to preserve meaningful vendor name
+  const separators = /\s{3,}|\/|\\|-\s*$/
+  if (separators.test(vendor)) {
+    // If there are clear separators, take the first meaningful part (vendor name)
+    const parts = vendor.split(separators)
+    vendor = parts[0]?.trim() || vendor
+  }
+  
+  // Capitalize properly - preserve existing capitalization for known patterns
+  // If it's all caps, convert to Title Case
+  // If it's mixed case, preserve it
+  if (vendor === vendor.toUpperCase() && vendor.length > 1) {
+    // All caps - convert to Title Case
+    vendor = vendor
+      .split(" ")
+      .map((word) => {
+        // Handle special cases like "AMZN" -> "Amzn", "JJ" -> "JJ"
+        if (word.length <= 2) return word
+        return word.charAt(0).toUpperCase() + word.slice(1).toLowerCase()
+      })
+      .join(" ")
+  } else {
+    // Mixed case - preserve but normalize
+    vendor = vendor
+      .split(" ")
+      .map((word) => {
+        // If word is all lowercase or all uppercase, capitalize properly
+        if (word === word.toLowerCase() || word === word.toUpperCase()) {
+          if (word.length <= 2) return word.toUpperCase() // Keep "JJ", "CA", etc.
+          return word.charAt(0).toUpperCase() + word.slice(1).toLowerCase()
+        }
+        // Already has mixed case, preserve it
+        return word
+      })
+      .join(" ")
+  }
+  
+  // Remove the 30-character limit - return full vendor name
+  return vendor.trim()
 }
 
 /**
@@ -487,33 +707,49 @@ class RecurringDetector {
       groupTransactions.sort((a, b) => a.date.getTime() - b.date.getTime())
 
       // Check if all transactions are on the same day - if so, skip (not a subscription)
+      // But allow if there are 3+ transactions (might be legitimate recurring charges)
       const firstDate = groupTransactions[0].date
       const allSameDay = groupTransactions.every((t) => {
         return t.date.getFullYear() === firstDate.getFullYear() &&
                t.date.getMonth() === firstDate.getMonth() &&
                t.date.getDate() === firstDate.getDate()
       })
-      if (allSameDay) {
-        continue // All transactions on same day = not a subscription
+      if (allSameDay && groupTransactions.length < 3) {
+        continue // All transactions on same day with only 2 occurrences = likely not a subscription
       }
 
-      // Require at least 2 transactions across different dates
-      // For 2 transactions, they must be at least 20 days apart (to avoid same-day duplicates)
+      // For 2 transactions, check if they're reasonably spaced (at least 7 days apart)
+      // This is less strict than before - allows more subscriptions to be detected
       if (groupTransactions.length === 2) {
         const daysDiff = Math.abs(
           (groupTransactions[1].date.getTime() - groupTransactions[0].date.getTime()) / (1000 * 60 * 60 * 24)
         )
-        if (daysDiff < 20) {
+        
+        // Require at least 7 days apart (more lenient than 20 days)
+        if (daysDiff < 7) {
           continue // Too close together, likely not a subscription
         }
         
-        // CRITICAL: For 2 transactions, they must be clearly monthly (20-40 days) or annual (350-380 days)
-        // Not just any random interval where they happen to be on the same day of month
-        const isMonthly = daysDiff >= 20 && daysDiff <= 40
+        // For 2 transactions, prefer clear patterns but don't require them
+        // Monthly: 25-35 days, Annual: 350-380 days, Weekly: 6-8 days, Biweekly: 12-16 days
+        const isMonthly = daysDiff >= 25 && daysDiff <= 35
         const isAnnual = daysDiff >= 350 && daysDiff <= 380
+        const isWeekly = daysDiff >= 6 && daysDiff <= 8
+        const isBiweekly = daysDiff >= 12 && daysDiff <= 16
         
-        if (!isMonthly && !isAnnual) {
-          continue // Not a clear monthly or annual pattern - likely coincidental
+        // If it's not a clear pattern, still allow it if amounts are very similar and same day of month
+        if (!isMonthly && !isAnnual && !isWeekly && !isBiweekly) {
+          // Check if amounts are very similar (within 5%) and same day of month
+          const amounts = groupTransactions.map((t) => t.amount)
+          const avgAmount = amounts.reduce((a, b) => a + b, 0) / amounts.length
+          const minAmount = Math.min(...amounts)
+          const maxAmount = Math.max(...amounts)
+          const variance = (maxAmount - minAmount) / avgAmount
+          
+          const sameDay = this.isSameDayOfMonth(groupTransactions)
+          if (variance > 0.05 || !sameDay) {
+            continue // Not a clear pattern and amounts vary or not same day of month
+          }
         }
       }
 
@@ -533,12 +769,15 @@ class RecurringDetector {
         continue
       }
 
-      // Check if transactions occur on the same day of month (within +/- 1 day)
+      // Check if transactions occur on the same day of month (within +/- 2 days for more flexibility)
       // This filters out one-time purchases that happen to occur at the same merchant
+      // But be more lenient - allow +/- 2 days instead of +/- 1
       const sameDay = this.isSameDayOfMonth(groupTransactions)
-      if (!sameDay) {
+      if (!sameDay && groupTransactions.length === 2) {
+        // For 2 transactions, require same day of month
         continue
       }
+      // For 3+ transactions, same day of month is preferred but not required if amounts are consistent
 
       // Mark all transactions in this group as subscriptions
       for (const transaction of groupTransactions) {
@@ -552,27 +791,23 @@ class RecurringDetector {
 
   /**
    * Normalize transaction key for grouping
-   * Group by description only (not amount) to handle currency conversion variations
-   * Amount similarity will be checked later in the detection logic
+   * Group by description and amount to identify recurring payments
+   * Improved to better preserve vendor names while removing noise
    */
   private normalizeKey(transaction: ParsedTransaction): string {
     // Remove location suffixes BEFORE lowercasing (they're often all-caps)
     let desc = transaction.description
+    
     // Remove trailing all-caps words separated by multiple spaces (likely locations)
     // Pattern: 2+ spaces + all caps word(s) (4+ chars) at end
     // This catches "SUPABASE                SINGAPORE" -> "SUPABASE"
     desc = desc.replace(/\s{2,}([A-Z]{4,}(\s+[A-Z]{4,})*)\s*$/g, "").trim()
-    // Also handle single space before location (e.g., "SAN FRANCISCO" after "SUBSCR")
-    // Common location patterns at end: single all-caps word or two all-caps words
-    desc = desc.replace(/\s+(SAN FRANCISCO|COVINA|SINGAPORE|VANCOUVER|MONTREAL|TORONTO|NEW YORK|LOS ANGELES)\s*$/i, "").trim()
-    // Generic: any trailing all-caps word(s) that look like locations
-    desc = desc.replace(/\s+([A-Z]{4,}(\s+[A-Z]{4,})*)\s*$/g, (match, location) => {
-      // Only remove if it's all caps and looks like a location (not part of vendor name)
-      if (location === location.toUpperCase() && location.length >= 4) {
-        return ""
-      }
-      return match
-    }).trim()
+    
+    // Remove common location names (cities, states, countries)
+    desc = desc.replace(/\s+(SAN FRANCISCO|COVINA|SINGAPORE|VANCOUVER|MONTREAL|TORONTO|NEW YORK|LOS ANGELES|ABBOTSFORD|BURNABY|RICHMOND|SURREY|CALGARY|EDMONTON|OTTAWA|QUEBEC|WINNIPEG|HAMILTON|KITCHENER|LONDON|HALIFAX|VICTORIA|WINDSOR|SASKATOON|REGINA|ST\.?\s*JOHN|ST\.?\s*JOHN'S|CHARLOTTETOWN|FREDERICTON|YELLOWKNIFE|WHITEHORSE|IQALUIT)\s*$/i, "").trim()
+    
+    // Remove phone numbers (e.g., "866-216-1072")
+    desc = desc.replace(/\s+\d{3}[-.\s]?\d{3}[-.\s]?\d{4}\s*$/g, "")
     
     // Now normalize: lowercase, remove extra spaces, remove common prefixes
     desc = desc
@@ -581,27 +816,24 @@ class RecurringDetector {
       .trim()
 
     // Remove common prefixes that might vary
-    desc = desc.replace(/^(purchase|debit|payment|transfer|ach|autopay|automatic|card)\s+/i, "")
+    desc = desc.replace(/^(purchase|debit|payment|transfer|ach|autopay|automatic|card|pos)\s+/i, "")
     desc = desc.replace(/\s+(purchase|debit|payment|transfer)$/i, "")
 
     // Remove transaction IDs, reference numbers, confirmation codes, etc.
     desc = desc.replace(/\b\d{10,}\b/g, "") // Remove long numbers (likely IDs)
     
-    // Remove alphanumeric codes, but be more careful - don't remove vendor names
-    // Codes are typically: mixed case with numbers, or all lowercase/uppercase with numbers
-    // Vendor names are typically: proper nouns (mixed case) or common words
-    // Remove codes that look like transaction IDs (e.g., "P3A5017B5F", "K94zgm", "6eavyqwv9r")
-    // But keep words that are likely vendor names (e.g., "vercel", "openai", "chatgpt")
-    desc = desc.replace(/\b[a-z]*[0-9]+[a-z0-9]*\b/gi, "") // Remove alphanumeric codes with numbers
-    desc = desc.replace(/\b[a-z]{1,2}[0-9]{4,}[a-z0-9]*\b/gi, "") // Remove codes like "K94zgm"
-    desc = desc.replace(/\b[0-9]+[a-z]{4,}\b/gi, "") // Remove codes starting with numbers
+    // Remove alphanumeric codes that look like transaction IDs
+    // Be careful not to remove vendor names that might have numbers
+    // Remove codes like "BB82053A1", "K94zgm", "6eavyqwv9r", "P3A5017B5F"
+    desc = desc.replace(/\s+[A-Z0-9]{6,12}\b/g, "") // Remove trailing alphanumeric codes (6-12 chars, uppercase/number mix)
+    desc = desc.replace(/\s+[a-z0-9]{6,12}\b/gi, "") // Remove trailing lowercase alphanumeric codes
     
-    desc = desc.replace(/\*\d{4}/g, "") // Remove card last 4 digits like *1234
-    desc = desc.replace(/\*[a-z]+/gi, "") // Remove things like *CHATGPT, *GSUITE (but keep vendor name)
+    desc = desc.replace(/\*\d{4,}/g, "") // Remove card last 4+ digits like *1234
+    desc = desc.replace(/\*[A-Z]+\s*$/g, "") // Remove trailing things like *CHATGPT, *GSUITE
 
     // Remove common suffixes like "ONLINE", "AUTHORIZED", etc.
-    desc = desc.replace(/\s+(online|authorized|pending|completed|processed)$/i, "")
-    desc = desc.replace(/\s+(subscr|subscription)$/i, "") // Remove "subscr" suffix
+    desc = desc.replace(/\s+(online|authorized|pending|completed|processed|subscr|subscription)\s*$/i, "")
+    
     // Remove underscores and replace with spaces
     desc = desc.replace(/_/g, " ")
 
@@ -609,20 +841,21 @@ class RecurringDetector {
     desc = desc.replace(/\s+/g, " ").trim()
 
     // Extract key merchant/service name (first few meaningful words)
-    const words = desc.split(/\s+/).filter((w) => w.length > 2)
-    const keyWords = words.slice(0, 4).join(" ") // Use first 4 meaningful words
+    // Use more words (up to 5) to better preserve vendor names
+    const words = desc.split(/\s+/).filter((w) => w.length > 1) // Changed from > 2 to > 1 to preserve short words
+    const keyWords = words.slice(0, 5).join(" ") // Use first 5 meaningful words (increased from 4)
 
-    // Round amount to nearest $2 for grouping (handles small currency conversion variations)
-    // This groups Supabase ($35-37) and Vercel ($28-30) together without being too aggressive
-    const roundedAmount = Math.round(transaction.amount / 2) * 2
+    // Round amount to nearest dollar for grouping (like PDFScanner)
+    // This is simpler and more consistent than rounding to $2
+    const roundedAmount = Math.round(transaction.amount)
 
     return `${keyWords}|${roundedAmount}`
   }
 
   /**
-   * Check if transactions occur on the same day of month (within +/- 1 day)
+   * Check if transactions occur on the same day of month (within +/- 2 days for flexibility)
    * This helps filter out one-time purchases that happen to occur at the same merchant
-   * Requirements: payments must occur on the same day every month +/- 1 day
+   * Requirements: payments must occur on the same day every month +/- 2 days (more lenient)
    */
   private isSameDayOfMonth(transactions: ParsedTransaction[]): boolean {
     if (transactions.length < 2) return false
@@ -646,16 +879,16 @@ class RecurringDetector {
       }
     }
 
-    // Check if all days are within +/- 1 day of the most common day
+    // Check if all days are within +/- 2 days of the most common day (more lenient)
     // Also handle month-end wraparound (e.g., 30th/31st to 1st/2nd)
     const allWithinRange = daysOfMonth.every((day) => {
       const diff = Math.abs(day - mostCommonDay)
-      // Within 1 day, or handle wraparound at month boundaries
-      if (diff <= 1) return true
+      // Within 2 days (more lenient than +/- 1), or handle wraparound at month boundaries
+      if (diff <= 2) return true
 
-      // Handle month-end wraparound: 30/31 to 1/2 should be considered close
-      if (mostCommonDay >= 29 && day <= 2) return true // e.g., 30th/31st to 1st/2nd
-      if (day >= 29 && mostCommonDay <= 2) return true // e.g., 1st/2nd to 30th/31st
+      // Handle month-end wraparound: 30/31 to 1/2/3 should be considered close
+      if (mostCommonDay >= 29 && day <= 3) return true // e.g., 30th/31st to 1st/2nd/3rd
+      if (day >= 29 && mostCommonDay <= 3) return true // e.g., 1st/2nd/3rd to 30th/31st
 
       return false
     })

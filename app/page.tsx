@@ -1,6 +1,6 @@
 "use client"
 
-import { useState, useEffect } from "react"
+import { useState, useEffect, useMemo } from "react"
 import { Header } from "@/components/header"
 import { FileUpload } from "@/components/file-upload"
 import { SpendingChart } from "@/components/spending-chart"
@@ -10,6 +10,53 @@ import { SubscriptionsPanel } from "@/components/subscriptions-panel"
 import { SummaryCards } from "@/components/summary-cards"
 import { generateSampleData } from "@/lib/sample-data"
 import type { Transaction, ParsedData } from "@/lib/types"
+
+// Date filter type - now supports range
+export interface DateFilter {
+  from: Date | null
+  to: Date | null
+}
+
+// Helper function to filter transactions by date range
+function filterTransactionsByDate(transactions: Transaction[], dateFilter: DateFilter | null): Transaction[] {
+  if (!dateFilter || (!dateFilter.from && !dateFilter.to)) return transactions
+  
+  return transactions.filter((t) => {
+    const date = t.date instanceof Date ? t.date : new Date(t.date)
+    const dateTime = date.getTime()
+    
+    // Check from date
+    if (dateFilter.from) {
+      const fromTime = dateFilter.from.getTime()
+      if (dateTime < fromTime) return false
+    }
+    
+    // Check to date (inclusive - end of day)
+    if (dateFilter.to) {
+      const toEndOfDay = new Date(dateFilter.to)
+      toEndOfDay.setHours(23, 59, 59, 999)
+      const toTime = toEndOfDay.getTime()
+      if (dateTime > toTime) return false
+    }
+    
+    return true
+  })
+}
+
+// Helper function to get min and max dates from transactions
+export function getTransactionDateRange(transactions: Transaction[]): { min: Date | null; max: Date | null } {
+  if (transactions.length === 0) return { min: null, max: null }
+  
+  const dates = transactions.map((t) => {
+    const date = t.date instanceof Date ? t.date : new Date(t.date)
+    return date.getTime()
+  })
+  
+  return {
+    min: new Date(Math.min(...dates)),
+    max: new Date(Math.max(...dates))
+  }
+}
 
 // Save transactions to JSON file via API
 async function saveTransactions(transactions: Transaction[]) {
@@ -68,6 +115,7 @@ export default function Dashboard() {
   const [isLoading, setIsLoading] = useState(false)
   const [showUpload, setShowUpload] = useState(false)
   const [isLoadingData, setIsLoadingData] = useState(true)
+  const [dateFilter, setDateFilter] = useState<DateFilter | null>(null)
 
   // Load transactions from file on mount
   useEffect(() => {
@@ -100,9 +148,23 @@ export default function Dashboard() {
     saveTransactions(updatedTransactions)
   }
 
+  // Get date range from all transactions
+  const dateRange = useMemo(() => getTransactionDateRange(transactions), [transactions])
+
+  // Filter transactions based on date filter
+  const filteredTransactions = useMemo(
+    () => filterTransactionsByDate(transactions, dateFilter),
+    [transactions, dateFilter]
+  )
+
   return (
     <div className="min-h-screen bg-background">
-      <Header />
+      <Header 
+        dateFilter={dateFilter}
+        onDateFilterChange={setDateFilter}
+        dateRange={dateRange}
+        transactions={filteredTransactions}
+      />
       <main className="container mx-auto px-4 py-8">
         {showUpload ? (
           <div className="space-y-4">
@@ -118,23 +180,23 @@ export default function Dashboard() {
           </div>
         ) : (
           <div className="space-y-6">
-            <SummaryCards transactions={transactions} />
+            <SummaryCards transactions={filteredTransactions} />
             <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
               <div className="lg:col-span-2">
-                <SpendingChart transactions={transactions} onUpdateTransactions={handleUpdateTransactions} />
+                <SpendingChart transactions={filteredTransactions} onUpdateTransactions={handleUpdateTransactions} />
               </div>
               <div>
-                <CategoryChart transactions={transactions} onUpdateTransactions={handleUpdateTransactions} />
+                <CategoryChart transactions={filteredTransactions} onUpdateTransactions={handleUpdateTransactions} />
               </div>
             </div>
             <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
               <SubscriptionsPanel 
-                transactions={transactions} 
+                transactions={filteredTransactions} 
                 onToggleSubscription={handleToggleSubscription}
                 onUpdateTransactions={handleUpdateTransactions}
               />
               <div className="lg:col-span-2">
-                <TopVendors transactions={transactions} onUpdateTransactions={handleUpdateTransactions} />
+                <TopVendors transactions={filteredTransactions} onUpdateTransactions={handleUpdateTransactions} />
               </div>
             </div>
             <div className="flex justify-center">
